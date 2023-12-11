@@ -1,5 +1,5 @@
 # memcache-dashboard
-Simple single-file modern Memcache dashboard.
+Simple single-file modern PHP-based Memcache dashboard.
 
 # Setup
 Open the file and add your server info.  
