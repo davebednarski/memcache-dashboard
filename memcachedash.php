@@ -21,7 +21,7 @@ class Server {
     /** @var string */
     public $host = '127.0.0.1';
     /** @var int */
-    public $port = 11211;
+    public $port = 0;
     /** @var string */
     public $friendlyName = 'Memcache server';
 }
@@ -61,6 +61,33 @@ class MemcacheItem {
 }
 
 /**
+ * The type of errors possible in the app.
+ */
+class MemcacheErrorType {
+    /**
+     * For error that shuts down all the app.
+     * @var string 
+     */
+    const ALL_APP = 'allApp';
+
+    /**
+     * For error that affects only the all items table.
+     * @var string
+     */
+    const MEMCACHE_ITEMS = 'memcacheItems';
+}
+
+/**
+ * Capture any errors for the UI to handle
+ */
+class MemcacheError {
+    /** @var string */
+    public $message = '';
+    /** @var string */
+    public $type = null;
+}
+
+/**
  * Simple memcache dashboard
  */
 class MemcacheDashboard
@@ -80,6 +107,9 @@ class MemcacheDashboard
     /** @var UserRequest | null */
     public $userRequest = null;
 
+    /** @var bool */
+    public $error = false;
+
     /** @var Memcache | null */
     private $memcache = null;
 
@@ -88,12 +118,36 @@ class MemcacheDashboard
     {
         $this->initServers($serversConfig);
         $this->setActiveServer();
-        $this->initMemcache();
+        $isSuccess = $this->initMemcache();
+        
+        // Sometimes the first call can fail for PHP. So use this as a guinea pig to wake it up the connection.
+        $v = $this->memcache->getVersion();
+
+        if (!$isSuccess) {
+            $error = new MemcacheError();
+            $error->message = 'There was an error with the host/port when adding this server to Memcache.';
+            $error->type = MemcacheErrorType::ALL_APP;
+            
+            $this->error = $error;
+            return;
+        }
+
+        $this->stats = $this->memcache->getStats();
+        
+        if (!$this->stats) {
+            $error = new MemcacheError();
+            $error->message = "There was an error connecting to Memcache.  Please check your connection, configuration, and/or server. Or just retry again.<br>host = \"{$this->activeServer->host}\"<br>port = \"{$this->activeServer->port}\" ";
+            $error->type = MemcacheErrorType::ALL_APP;
+
+            $this->error = $error;
+            return;
+        }
+        
         $this->handleRequest();
 
         // Only need to fetch the data if is a GET request
         if ($_SERVER['REQUEST_METHOD'] === 'GET') {
-            $this->initData();
+            $this->items = $this->getAllItems();
         }
     }
 
@@ -139,14 +193,26 @@ class MemcacheDashboard
     {
         $this->memcache = new Memcache();
         $isSuccess = $this->memcache->addServer("{$this->activeServer->host}:{$this->activeServer->port}");
+        return $isSuccess;
     }
 
-    public function initData()
+    public function getAllItems()
     {
         $list = array();
         $allSlabs = $this->memcache->getExtendedStats('slabs');
 
         foreach ($allSlabs as $server => $slabs) {
+            
+            // if false, PHP is reporting a failure.
+            if ($slabs === false) {
+                $error = new MemcacheError();
+                $error->message = "There was an error reported from the Memcache items from PHP's getExtendedStats('slabs').  Please try refreshing the page.";
+                $error->type = MemcacheErrorType::MEMCACHE_ITEMS;
+                
+                $this->error = $error;
+                continue;
+            }
+            
             foreach ($slabs as $slabId => $slabMeta) {
                 if (!is_int($slabId)) {continue;}
                 $cdump = $this->memcache->getExtendedStats('cachedump', (int)$slabId, 1000);
@@ -183,8 +249,7 @@ class MemcacheDashboard
             }
         }
         
-        $this->items = $list;
-        $this->stats = $this->memcache->getStats();
+        return $list;
     }
 
     public function handleRequest()
@@ -232,12 +297,13 @@ class MemcacheDashboard
 // data
 $dash = new MemcacheDashboard($serversConfig);
 
-// major areas
+// major data areas
 $servers = $dash->servers;
 $activeServer = $dash->activeServer;
 $items = $dash->items;
 $stats = $dash->stats;
 $getRequest = $dash->userRequest;
+$error = $dash->error;
 
 ?>
 <!DOCTYPE html>
@@ -290,8 +356,13 @@ $getRequest = $dash->userRequest;
         </div>
     </nav>
     
+    <? if ($error && $error->type === MemcacheErrorType::ALL_APP): ?>
+        <div class="alert alert-danger m-3" role="alert">
+            <?= $error->message ?>
+        </div>
+    <? else: ?>
     <main class="container-fluid mt-4">
-        
+
         <a id="stats">&nbsp;</a>
         <div class="accordion" id="infoAccordion">
             <div class="accordion-item">
@@ -468,7 +539,7 @@ $getRequest = $dash->userRequest;
 
         <a id="actions">&nbsp;</a>
         <div class="row">
-            <div class="col">
+            <div class="col-md">
                 <div class="card border-primary">
                     <div class="card-header">
                         <h3 class="card-title">Get Item</h3>
@@ -478,9 +549,9 @@ $getRequest = $dash->userRequest;
                         <form id="js-getkey-form" action="<?= $_SERVER['PHP_SELF'] ?>" method="post">
                             <div class="mb-3">
                                 <label for="getKey" class="form-label">Key</label>
-                                <input id="getKey" type="text" name="getkey" class="form-control" 
-                                       required 
-                                       maxlength="200" 
+                                <input id="getKey" type="text" name="getkey" class="form-control"
+                                       required
+                                       maxlength="200"
                                        value="<?= $getRequest ? htmlspecialchars($getRequest->key, ENT_NOQUOTES) : '' ?>">
                             </div>
                             <div class="mb-3 ">
@@ -520,28 +591,28 @@ $getRequest = $dash->userRequest;
                     </div>
                 </div>
             </div>
-            <div class="col">
+            <div class="col-md mt-3 mt-md-0">
                 <div class="card border-primary">
                     <div class="card-header">
-                        <h3 class="card-title">Set Item</h3> 
-                        <small class="text-muted">Set new or overwrite existing item in Memcache.</small> 
+                        <h3 class="card-title">Set Item</h3>
+                        <small class="text-muted">Set new or overwrite existing item in Memcache.</small>
                     </div>
                     <div class="card-body">
                         <form action="<?= $_SERVER['PHP_SELF'] ?>" method="post">
                             <div class="mb-3">
                                 <label for="saveKey" class="form-label">Key</label>
-                                <input id="saveKey" type="text" name="key" class="form-control" 
-                                       maxlength="200" 
-                                       required 
-                                       pattern="[^<> '\x22`%]+" 
+                                <input id="saveKey" type="text" name="key" class="form-control"
+                                       maxlength="200"
+                                       required
+                                       pattern="[^<> '\x22`%]+"
                                        aria-describedby="saveKeyHelp">
                                 <!-- Disallow a few special chars for security and of course spaces too. -->
                                 <div id="saveKeyHelp" class="form-text">Disallowed chars = <, >, ', ", `, %, and space</div>
                             </div>
                             <div class="mb-3 mt-2">
                                 <label for="saveValue" class="form-label">Value</label>
-                                <textarea id="saveValue" name="value" class="form-control" 
-                                          required 
+                                <textarea id="saveValue" name="value" class="form-control"
+                                          required
                                           aria-describedby="saveValueHelp"></textarea>
                                 <div id="saveValueHelp" class="form-text">Stripped chars = < and ></div>
                             </div>
@@ -568,7 +639,7 @@ $getRequest = $dash->userRequest;
         </div>
 
         <a id="stored-keys">&nbsp;</a>
-        <div class="card mt-4">
+        <div class="card my-4">
             <div class="card-header">
                 <div class="d-flex align-items-center">
                     <h3 class="card-title me-4">"All" Stored Keys</h3>
@@ -584,93 +655,104 @@ $getRequest = $dash->userRequest;
                     What does work good is "Get item" and "Set item" above.
                 </div>
 
-                <div class="table-responsive">
-                    <table id="js-data-table" class="table table-bordered table-hover table-striped"
-                           style="table-layout: fixed;">
-                        <thead>
-                            <tr>
-                                <th style="width: 20%;">key</th>
-                                <th style="width: 60%;">value</th>
-                                <th style="width: 10%;">expire (PST)</th>
-                                <th style="width: 6%;">bytes</th>
-                                <th style="width: 4%;">delete</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            <?php foreach ($items as $i): ?>
+                <? if ($error && $error->type === MemcacheErrorType::MEMCACHE_ITEMS): ?>
+                    <div class="alert alert-danger" role="alert">
+                        <?= $error->message ?>
+                    </div>
+                <? else: ?>
+                    <div class="table-responsive">
+                        <table id="js-data-table" class="table table-bordered table-hover table-striped"
+                               style="table-layout: fixed;">
+                            <thead>
                                 <tr>
-                                    <td>
-                                        <span class="text-break"><?= htmlspecialchars($i->key, ENT_NOQUOTES) ?></span>
-                                    </td>
-                                    <td>
-                                        <?= htmlspecialchars($i->value, ENT_NOQUOTES) ?>
-                                    </td>
-                                    <td>
-                                        <?= htmlspecialchars($i->expire, ENT_NOQUOTES) ?>
-                                    </td>
-                                    <td>
-                                        <?= htmlspecialchars($i->bytes, ENT_NOQUOTES) ?>
-                                    </td>
-                                    <td>
-                                        <form action="<?= $_SERVER['PHP_SELF'] ?>" method="post">
-                                            <input type="hidden" name="del" value="<?= htmlspecialchars($i->key, ENT_NOQUOTES) ?>">
-                                            <button type="submit" class="btn btn-danger">X</button>
-                                        </form>
-                                    </td>
+                                    <th style="width: 20%;">key</th>
+                                    <th style="width: 60%;">value</th>
+                                    <th style="width: 10%;">expire (PST)</th>
+                                    <th style="width: 6%;">bytes</th>
+                                    <th style="width: 4%;">delete</th>
                                 </tr>
-                            <?php endforeach; ?>
-                        </tbody>
-                    </table>
-                </div>
+                            </thead>
+                            <tbody>
+                                <?php foreach ($items as $i): ?>
+                                    <tr>
+                                        <td>
+                                            <span class="text-break"><?= htmlspecialchars($i->key, ENT_NOQUOTES) ?></span>
+                                        </td>
+                                        <td>
+                                            <?= htmlspecialchars($i->value, ENT_NOQUOTES) ?>
+                                        </td>
+                                        <td>
+                                            <?= htmlspecialchars($i->expire, ENT_NOQUOTES) ?>
+                                        </td>
+                                        <td>
+                                            <?= htmlspecialchars($i->bytes, ENT_NOQUOTES) ?>
+                                        </td>
+                                        <td>
+                                            <form action="<?= $_SERVER['PHP_SELF'] ?>" method="post">
+                                                <input type="hidden" name="del" value="<?= htmlspecialchars($i->key, ENT_NOQUOTES) ?>">
+                                                <button type="submit" class="btn btn-danger">X</button>
+                                            </form>
+                                        </td>
+                                    </tr>
+                                <?php endforeach; ?>
+                            </tbody>
+                        </table>
+                    </div>
+                <? endif ?>
             </div>
+        </div>
+    </main>
+    <? endif; ?>
+    
+   <footer>
+       <script src="https://code.jquery.com/jquery-3.7.1.min.js" integrity="sha256-/JqT3SQfawRcv/BIHPThkBvs0OEvtFFmqPF/lYI/Cxo=" crossorigin="anonymous"></script>
+       <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js" integrity="sha384-C6RzsynM9kWDrMNeT87bh95OGNyZPhcTNXj1NW7RuBCsyN/o0jlpcV8Qyq46cDfL" crossorigin="anonymous"></script>
+       <script src="https://cdn.datatables.net/v/dt/dt-1.13.8/datatables.min.js"></script>
+       <script>
+           $(function () {
+               $("#js-getkey-form").on('submit', (e) => {
+                   e.preventDefault();
+                   const form = document.getElementById('js-getkey-form');
+                   const formData = new FormData(form);
+                   const key = formData.get('getkey');
 
-            <script src="https://code.jquery.com/jquery-3.7.1.min.js" integrity="sha256-/JqT3SQfawRcv/BIHPThkBvs0OEvtFFmqPF/lYI/Cxo=" crossorigin="anonymous"></script>
-            <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js" integrity="sha384-C6RzsynM9kWDrMNeT87bh95OGNyZPhcTNXj1NW7RuBCsyN/o0jlpcV8Qyq46cDfL" crossorigin="anonymous"></script>
-            <script src="https://cdn.datatables.net/v/dt/dt-1.13.8/datatables.min.js"></script>
-            <script>
-                $(function () {
-                    $("#js-getkey-form").on('submit', (e) => {
-                        e.preventDefault();
-                        const form = document.getElementById('js-getkey-form');
-                        const formData = new FormData(form);
-                        const key = formData.get('getkey');
-                        
-                        const url = new URL(location.href);
-                        const searchParams = url.searchParams;
-                        searchParams.set('getkey', encodeURIComponent(key.trim()));
-                        window.location.href = `${location.origin}${location.pathname}?${searchParams}`;
-                    });
+                   const url = new URL(location.href);
+                   const searchParams = url.searchParams;
+                   searchParams.set('getkey', encodeURIComponent(key.trim()));
+                   window.location.href = `${location.origin}${location.pathname}?${searchParams}`;
+               });
 
-                    $("#js-clear-getkey").on('click', (e) => {
-                        e.preventDefault();
-                        const url = new URL(location.href);
-                        const searchParams = url.searchParams;
-                        searchParams.delete('getkey');
-                        window.location.href = `${location.origin}${location.pathname}?${searchParams}`;
-                    });
+               $("#js-clear-getkey").on('click', (e) => {
+                   e.preventDefault();
+                   const url = new URL(location.href);
+                   const searchParams = url.searchParams;
+                   searchParams.delete('getkey');
+                   window.location.href = `${location.origin}${location.pathname}?${searchParams}`;
+               });
 
-                    $("#js-flush-form").on('submit', (e) => {
-                        if (!window.confirm('Are you sure?')) {
-                            e.preventDefault();
-                        }
-                    });
-                    
-                    $('#js-change-server').on('change', (e) => {
-                        $('#js-change-server-loader').removeAttr('hidden');
-                        const serverIndex = e.currentTarget.value;
-                        window.location.href = `${location.protocol}//${location.hostname}${location.pathname}?server=${serverIndex}`
-                    });
-                });
-                
-                // Docs = https://datatables.net/examples/basic_init/dom.html
-                new DataTable('#js-data-table', {
-                    stateSave: true,
-                    lengthMenu: [
-                        [10, 25, 50, -1],
-                        [10, 25, 50, 'All']
-                    ],
-                    dom: '<"top"lif>rt<"bottom"p><"clear">'
-                });
-            </script>
+               $("#js-flush-form").on('submit', (e) => {
+                   if (!window.confirm('Are you sure?')) {
+                       e.preventDefault();
+                   }
+               });
+
+               $('#js-change-server').on('change', (e) => {
+                   $('#js-change-server-loader').removeAttr('hidden');
+                   const serverIndex = e.currentTarget.value;
+                   window.location.href = `${location.protocol}//${location.hostname}${location.pathname}?server=${serverIndex}`
+               });
+           });
+
+           // Docs = https://datatables.net/examples/basic_init/dom.html
+           new DataTable('#js-data-table', {
+               stateSave: true,
+               lengthMenu: [
+                   [10, 25, 50, -1],
+                   [10, 25, 50, 'All']
+               ],
+               dom: '<"top"lif>rt<"bottom"p><"clear">'
+           });
+       </script>
+   </footer>
 </body>
 </html>
